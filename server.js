@@ -8,15 +8,22 @@ const { initDb, query } = require('./db');
 const { producer, consumerRealtime, consumerPersistence, initKafka } = require('./kafka');
 
 const bcrypt = require('bcryptjs');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // Limit each IP to 10 requests per window
+  message: { error: 'Too many requests from this IP, please try again after 15 minutes' }
+});
+
 const JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey';
 
-app.post('/register', async (req, res) => {
+app.post('/register', authLimiter, async (req, res) => {
   const { username, password } = req.body;
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -31,7 +38,7 @@ app.post('/register', async (req, res) => {
   }
 });
 
-app.post('/login', async (req, res) => {
+app.post('/login', authLimiter, async (req, res) => {
   const { username, password } = req.body;
   try {
     const result = await query('SELECT * FROM users WHERE username = $1', [username]);
@@ -71,6 +78,7 @@ io.use((socket, next) => {
 
 const TOPIC = 'location_updates';
 const userLocations = {}; // In-memory cache for latest positions
+const userLastUpdateTime = {}; // For Socket.IO rate limiting
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.userId} (Socket: ${socket.id})`);
@@ -79,6 +87,15 @@ io.on('connection', (socket) => {
   socket.emit('initial_locations', userLocations);
 
   socket.on('update_location', async (data) => {
+    const now = Date.now();
+    const lastUpdate = userLastUpdateTime[socket.userId] || 0;
+    
+    // Rate limit: Allow 1 update per second maximum (1000ms)
+    if (now - lastUpdate < 1000) {
+      return; // Ignore updates that are too frequent
+    }
+    userLastUpdateTime[socket.userId] = now;
+
     const payload = {
       userId: socket.userId,
       latitude: data.latitude,
@@ -102,6 +119,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', async () => {
     console.log(`User disconnected: ${socket.userId}`);
     delete userLocations[socket.userId];
+    delete userLastUpdateTime[socket.userId];
     
     const offlinePayload = {
       userId: socket.userId,
